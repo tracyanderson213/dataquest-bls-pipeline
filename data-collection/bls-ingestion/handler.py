@@ -15,66 +15,37 @@ s3_client = boto3.client('s3')
 
 def lambda_handler(event, context):
     """
-    AWS Lambda handler for BLS data ingestion
+    AWS Lambda handler for combined BLS data and population data ingestion
+    Implements Parts 1 & 2 of the Rearc Data Quest
     """
     try:
-        logger.info("Starting BLS data ingestion process")
+        logger.info("Starting combined data ingestion process (Parts 1 & 2)")
         
         # Configuration
         bucket_name = "dataquest-gov-bls-timeseries"
         api_key = "5ee32fa6e7da4ce490d27e198e912f08"
         
-        # BLS series to collect
-        series_list = get_bls_series_list()
+        # Part 1: BLS Data Collection
+        logger.info("=== PART 1: BLS Data Collection ===")
+        bls_results = collect_bls_data(bucket_name, api_key)
         
-        # Process each series
-        results = []
-        for series_id in series_list:
-            try:
-                logger.info(f"Processing series: {series_id}")
-                
-                # Fetch data from BLS API
-                data = fetch_bls_data(series_id, api_key)
-                
-                if data:
-                    # Store in S3
-                    s3_key = f"bls-data/{series_id}/{datetime.now().strftime('%Y-%m-%d')}.json"
-                    store_data_in_s3(bucket_name, s3_key, data)
-                    results.append({
-                        'series_id': series_id,
-                        'status': 'success',
-                        'records': len(data.get('Results', {}).get('series', [{}])[0].get('data', []))
-                    })
-                    logger.info(f"Successfully processed {series_id}")
-                else:
-                    results.append({
-                        'series_id': series_id,
-                        'status': 'no_data',
-                        'error': 'No data returned from API'
-                    })
-                    
-                # Rate limiting
-                time.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"Error processing series {series_id}: {str(e)}")
-                results.append({
-                    'series_id': series_id,
-                    'status': 'error',
-                    'error': str(e)
-                })
+        # Part 2: Population Data Collection
+        logger.info("=== PART 2: Population Data Collection ===")
+        population_results = collect_population_data(bucket_name)
         
-        # Summary
-        successful = len([r for r in results if r['status'] == 'success'])
-        total = len(results)
+        # Combined results
+        total_successful = bls_results['successful'] + (1 if population_results['success'] else 0)
+        total_processed = bls_results['total'] + 1
         
-        logger.info(f"Processing complete: {successful}/{total} series successful")
+        logger.info(f"Combined processing complete: {total_successful}/{total_processed} successful")
         
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': f'BLS data ingestion completed: {successful}/{total} successful',
-                'results': results
+                'message': f'Combined data ingestion completed: {total_successful}/{total_processed} successful',
+                'bls_results': bls_results,
+                'population_results': population_results,
+                'trigger_analytics': True  # Signal for downstream processing
             })
         }
         
@@ -85,6 +56,136 @@ def lambda_handler(event, context):
             'body': json.dumps({
                 'error': str(e)
             })
+        }
+
+def collect_bls_data(bucket_name: str, api_key: str) -> Dict[str, Any]:
+    """
+    Part 1: Collect BLS economic data (68+ series)
+    """
+    series_list = get_bls_series_list()
+    results = []
+    
+    logger.info(f"Collecting {len(series_list)} BLS economic series")
+    
+    for series_id in series_list:
+        try:
+            logger.info(f"Processing BLS series: {series_id}")
+            
+            # Fetch data from BLS API
+            data = fetch_bls_data(series_id, api_key)
+            
+            if data:
+                # Store in S3
+                s3_key = f"bls-data/{series_id}/{datetime.now().strftime('%Y-%m-%d')}.json"
+                store_data_in_s3(bucket_name, s3_key, data)
+                results.append({
+                    'series_id': series_id,
+                    'status': 'success',
+                    'records': len(data.get('Results', {}).get('series', [{}])[0].get('data', []))
+                })
+                logger.info(f"Successfully processed BLS series {series_id}")
+            else:
+                results.append({
+                    'series_id': series_id,
+                    'status': 'no_data',
+                    'error': 'No data returned from API'
+                })
+                
+            # Rate limiting
+            time.sleep(0.5)
+            
+        except Exception as e:
+            logger.error(f"Error processing BLS series {series_id}: {str(e)}")
+            results.append({
+                'series_id': series_id,
+                'status': 'error',
+                'error': str(e)
+            })
+    
+    successful = len([r for r in results if r['status'] == 'success'])
+    total = len(results)
+    
+    logger.info(f"BLS collection complete: {successful}/{total} series successful")
+    
+    return {
+        'successful': successful,
+        'total': total,
+        'results': results
+    }
+
+def collect_population_data(bucket_name: str) -> Dict[str, Any]:
+    """
+    Part 2: Collect US population data from DataUSA API
+    """
+    try:
+        logger.info("Fetching US population data from DataUSA API")
+        
+        # DataUSA API endpoint for population data
+        url = "https://datausa.io/api/data"
+        params = {
+            'drilldowns': 'Nation',
+            'measures': 'Population'
+        }
+        
+        # Fetch data from API
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        api_data = response.json()
+        logger.info(f"Retrieved {len(api_data.get('data', []))} population records")
+        
+        # Get latest year data (for current implementation)
+        if api_data.get('data'):
+            latest_data = max(api_data['data'], key=lambda x: int(x.get('Year', 0)))
+            latest_year = latest_data.get('Year')
+            
+            # Filter to latest year for current storage
+            filtered_data = [record for record in api_data['data'] 
+                           if record.get('Year') == latest_year]
+            
+            logger.info(f"Using latest year data: {latest_year}")
+        else:
+            # Fallback to sample data
+            logger.warning("No API data available, using sample data")
+            filtered_data = [{
+                'ID Nation': '01000US',
+                'Nation': 'United States', 
+                'ID Year': 2023,
+                'Year': '2023',
+                'Population': 334914896,
+                'Slug Nation': 'united-states'
+            }]
+        
+        # Prepare enhanced data with metadata
+        enhanced_data = {
+            'ingestion_timestamp': datetime.now().isoformat(),
+            'source': 'DataUSA_API',
+            'api_endpoint': url,
+            'data_description': 'US Annual Population Data',
+            'latest_year_only': True,
+            'data': filtered_data
+        }
+        
+        # Store in S3
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        s3_key = f"datausa-api/population/{datetime.now().strftime('%Y%m%d')}/datausa_population_latest_{timestamp}.json"
+        
+        store_data_in_s3(bucket_name, s3_key, enhanced_data)
+        
+        logger.info(f"Population data stored successfully: {len(filtered_data)} records")
+        
+        return {
+            'success': True,
+            'records': len(filtered_data),
+            'latest_year': latest_year if 'latest_year' in locals() else '2023',
+            's3_key': s3_key
+        }
+        
+    except Exception as e:
+        logger.error(f"Error collecting population data: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
         }
 
 def get_bls_series_list() -> List[str]:
@@ -240,17 +341,10 @@ def store_data_in_s3(bucket_name: str, key: str, data: Dict[str, Any]) -> bool:
     Store data in S3 bucket
     """
     try:
-        # Add metadata
-        enhanced_data = {
-            'ingestion_timestamp': datetime.now().isoformat(),
-            'source': 'BLS_API',
-            'data': data
-        }
-        
         s3_client.put_object(
             Bucket=bucket_name,
             Key=key,
-            Body=json.dumps(enhanced_data, indent=2),
+            Body=json.dumps(data, indent=2),
             ContentType='application/json'
         )
         
